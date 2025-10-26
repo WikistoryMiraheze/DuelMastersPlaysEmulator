@@ -35,6 +35,7 @@ import numpy as np
 
 from card_effects import SPELL_TARGET_PROMPTS
 from cpu_ai import SimpleCpuAgent
+from model_cpu_agent import PHASE_NAMES, PHASE_TO_INDEX
 from emulator import Card, Game, Player, build_enemy_deck, build_my_deck, create_card_by_name
 
 
@@ -254,6 +255,7 @@ def _summarize_player(snapshot: Dict[str, Any]) -> np.ndarray:
     mana_zone: List[Dict[str, Any]] = snapshot.get("mana_zone", [])  # type: ignore[assignment]
     shield_zone: List[Dict[str, Any]] = snapshot.get("shields", [])  # type: ignore[assignment]
     graveyard: List[Dict[str, Any]] = snapshot.get("graveyard", [])  # type: ignore[assignment]
+    hand_cards: List[Dict[str, Any]] = snapshot.get("hand", [])  # type: ignore[assignment]
 
     tapped = sum(1 for card in battle_zone if card.get("tapped"))
     total_power = sum(_safe_power(card) for card in battle_zone)
@@ -262,6 +264,18 @@ def _summarize_player(snapshot: Dict[str, Any]) -> np.ndarray:
     civilizations = {
         civ for card in mana_zone for civ in card.get("civilizations", [])
     }
+
+    def _types(card: Dict[str, Any]) -> set:
+        return set(card.get("types", []))
+
+    creature_types = {"クリーチャー", "進化クリーチャー"}
+    spell_types = {"呪文"}
+
+    hand_costs = [float(card.get("cost") or 0.0) for card in hand_cards]
+    hand_creatures = sum(1 for card in hand_cards if _types(card) & creature_types)
+    hand_spells = sum(1 for card in hand_cards if _types(card) & spell_types)
+    hand_cost_total = float(sum(hand_costs))
+    hand_cost_max = max(hand_costs, default=0.0)
 
     return np.array(
         [
@@ -275,6 +289,15 @@ def _summarize_player(snapshot: Dict[str, Any]) -> np.ndarray:
             float(len(civilizations)),
             float(len(shield_zone)),
             float(len(graveyard)),
+            float(len(hand_cards)),
+            float(hand_creatures),
+            float(hand_spells),
+            float(hand_cost_total),
+            float(hand_cost_max),
+            float(snapshot.get("deck_size", 0)),
+            float(snapshot.get("available_mana", 0)),
+            float(snapshot.get("max_available_mana", 0)),
+            float(snapshot.get("max_mana", len(mana_zone))),
         ],
         dtype=np.float32,
     )
@@ -282,10 +305,13 @@ def _summarize_player(snapshot: Dict[str, Any]) -> np.ndarray:
 
 def build_feature_vector(
     snapshot: Dict[str, Any],
+    *,
     turn_number: int,
+    phase: str,
+    effect_depth: float,
+    shield_depth: float,
     player1_name: str,
     player2_name: str,
-    tracker: StackTracker,
 ) -> np.ndarray:
     player1_snapshot = snapshot[player1_name]
     player2_snapshot = snapshot[player2_name]
@@ -294,17 +320,14 @@ def build_feature_vector(
     p2_summary = _summarize_player(player2_snapshot)
     diff = p1_summary - p2_summary
 
-    turn_index = max(0, min(turn_number - 1, len(tracker.turn_effect_depths) - 1))
-    effect_depth = (
-        tracker.turn_effect_depths[turn_index] if tracker.turn_effect_depths else 0
-    )
-    shield_depth = (
-        tracker.turn_shield_depths[turn_index] if tracker.turn_shield_depths else 0
-    )
+    phase_vector = np.zeros(len(PHASE_NAMES), dtype=np.float32)
+    phase_index = PHASE_TO_INDEX.get(phase, PHASE_TO_INDEX["turn_end"])
+    phase_vector[phase_index] = 1.0
 
     return np.concatenate(
         [
             np.array([float(turn_number)], dtype=np.float32),
+            phase_vector,
             p1_summary,
             p2_summary,
             diff,
@@ -348,12 +371,13 @@ def collect_game_samples(
     )
 
     tracker = install_stack_tracker(game)
+    phase_counts = {phase: 0 for phase in PHASE_NAMES}
 
     game.start_game()
     if game.game_over:
         tracker.finalize_turn()
         winner_label = _label_for_winner(game, player1)
-        return [], winner_label, _summarize_game(game_index, game, tracker)
+        return [], winner_label, _summarize_game(game_index, game, tracker, phase_counts)
 
     previous_turn = game.turn_number
     while not game.game_over:
@@ -367,20 +391,28 @@ def collect_game_samples(
 
     winner_label = _label_for_winner(game, player1)
     samples: List[np.ndarray] = []
-    for turn_number in sorted(game.turn_end_snapshots):
-        snapshot = game.get_turn_end_zone_state(turn_number)
-        if snapshot is None:
-            continue
-        features = build_feature_vector(
-            snapshot,
-            turn_number,
-            player1.name,
-            player2.name,
-            tracker,
-        )
-        samples.append(features)
+    for turn_number in sorted(game.turn_phase_snapshots):
+        phase_entries = game.turn_phase_snapshots[turn_number]
+        for phase in PHASE_NAMES:
+            entry = phase_entries.get(phase)
+            if not entry:
+                continue
+            snapshot = entry.get("zones")
+            if snapshot is None:
+                continue
+            features = build_feature_vector(
+                snapshot,
+                turn_number=turn_number,
+                phase=phase,
+                effect_depth=float(entry.get("effect_depth", 0)),
+                shield_depth=float(entry.get("shield_depth", 0)),
+                player1_name=player1.name,
+                player2_name=player2.name,
+            )
+            samples.append(features)
+            phase_counts[phase] += 1
 
-    return samples, winner_label, _summarize_game(game_index, game, tracker)
+    return samples, winner_label, _summarize_game(game_index, game, tracker, phase_counts)
 
 
 def _raise_unexpected_input(prompt: str) -> str:
@@ -399,6 +431,7 @@ def _summarize_game(
     game_index: int,
     game: Game,
     tracker: StackTracker,
+    phase_counts: Dict[str, int],
 ) -> Dict[str, Any]:
     return {
         "game_index": game_index,
@@ -406,6 +439,7 @@ def _summarize_game(
         "winner": None if game.winner is None else game.winner.name,
         "max_effect_stack": tracker.game_max_effect_stack_depth,
         "max_shield_stack": tracker.game_max_shield_stack_depth,
+        "phase_counts": dict(phase_counts),
     }
 
 
@@ -495,6 +529,7 @@ def collect_dataset(config: TrainingConfig) -> Tuple[np.ndarray, np.ndarray, Dic
     all_labels: List[int] = []
     per_game_metrics: List[Dict[str, Any]] = []
     results = {"wins": 0, "losses": 0, "draws": 0}
+    aggregate_phase_counts = {phase: 0 for phase in PHASE_NAMES}
 
     for game_index in range(config.games):
         random_seed = rng.randrange(1 << 30)
@@ -507,6 +542,10 @@ def collect_dataset(config: TrainingConfig) -> Tuple[np.ndarray, np.ndarray, Dic
             deck_factory_b,
         )
         per_game_metrics.append(metrics)
+        counts = metrics.get("phase_counts", {})
+        for phase, value in counts.items():
+            if phase in aggregate_phase_counts:
+                aggregate_phase_counts[phase] += int(value)
 
         if label is None:
             results["draws"] += 1
@@ -535,10 +574,12 @@ def collect_dataset(config: TrainingConfig) -> Tuple[np.ndarray, np.ndarray, Dic
             "l2": config.l2,
             "seed": config.seed,
             "agent": config.agent,
+            "phases": list(PHASE_NAMES),
         },
         "samples": int(feature_matrix.shape[0]),
         "feature_dim": int(feature_matrix.shape[1]),
         "results": results,
+        "phase_counts": aggregate_phase_counts,
         "per_game": per_game_metrics,
     }
 

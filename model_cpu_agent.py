@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import FrozenSet, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
 from cpu_ai import SimpleCpuAgent
 from emulator import Card, Game, Player, has_w_breaker
+
+
+PHASE_NAMES: Tuple[str, ...] = (
+    "pre_mana",
+    "post_mana",
+    "pre_main",
+    "post_main",
+    "pre_attack",
+    "post_attack",
+    "turn_end",
+)
+PHASE_TO_INDEX = {name: index for index, name in enumerate(PHASE_NAMES)}
 
 
 @dataclass(frozen=True)
@@ -25,6 +37,16 @@ class PlayerSummary:
     mana_civilizations: FrozenSet[str]
     shields: int
     graveyard: int
+    hand_cards: int
+    hand_creatures: int
+    hand_spells: int
+    hand_cost_total: float
+    hand_cost_max: float
+    deck_cards: int
+    available_mana: float
+    max_available_mana: float
+    max_mana: float
+    hand_costs: Tuple[float, ...] = field(default_factory=tuple, repr=False)
 
     def untapped_creatures(self) -> int:
         return max(0, self.battle_creatures - self.tapped_creatures)
@@ -42,30 +64,75 @@ class PlayerSummary:
                 float(len(self.mana_civilizations)),
                 float(self.shields),
                 float(self.graveyard),
+                float(self.hand_cards),
+                float(self.hand_creatures),
+                float(self.hand_spells),
+                float(self.hand_cost_total),
+                float(self.hand_cost_max),
+                float(self.deck_cards),
+                float(self.available_mana),
+                float(self.max_available_mana),
+                float(self.max_mana),
             ],
             dtype=np.float32,
         )
 
-    def with_mana_card(self, card: Card) -> "PlayerSummary":
-        civilizations = set(self.mana_civilizations)
-        civilizations.update(card.civilizations)
-        mana_number = float(card.mana_number or 0)
+    def without_hand_card(self, card: Card) -> "PlayerSummary":
+        costs = list(self.hand_costs)
+        cost_value = float(card.cost or 0)
+        try:
+            costs.remove(cost_value)
+        except ValueError:
+            pass
+
+        hand_cards = max(0, self.hand_cards - 1)
+        hand_creatures = max(0, self.hand_creatures - (1 if card.is_creature() else 0))
+        hand_spells = max(0, self.hand_spells - (1 if card.is_spell() else 0))
+        hand_cost_total = max(0.0, self.hand_cost_total - cost_value)
+        hand_cost_max = max(costs) if costs else 0.0
+
         return dataclasses.replace(
             self,
-            mana_cards=self.mana_cards + 1,
-            mana_pips=self.mana_pips + mana_number,
+            hand_cards=hand_cards,
+            hand_creatures=hand_creatures,
+            hand_spells=hand_spells,
+            hand_cost_total=hand_cost_total,
+            hand_cost_max=hand_cost_max,
+            hand_costs=tuple(costs),
+        )
+
+    def with_mana_card(self, card: Card) -> "PlayerSummary":
+        base = self.without_hand_card(card)
+        civilizations = set(base.mana_civilizations)
+        civilizations.update(card.civilizations)
+        mana_number = float(card.mana_number or 0)
+        available_mana = base.available_mana
+        max_available_mana = base.max_available_mana
+        if card.mana_number == 1:
+            max_available_mana += 1.0
+            if not card.is_multicolored():
+                available_mana += 1.0
+        return dataclasses.replace(
+            base,
+            mana_cards=base.mana_cards + 1,
+            mana_pips=base.mana_pips + mana_number,
             mana_civilizations=frozenset(civilizations),
+            max_mana=base.max_mana + 1.0,
+            max_available_mana=max_available_mana,
+            available_mana=available_mana,
         )
 
     def with_creature_added(self, card: Card, *, tapped: bool = False) -> "PlayerSummary":
+        base = self.without_hand_card(card)
         power = float(card.power or 0)
-        tapped_creatures = self.tapped_creatures + (1 if tapped else 0)
+        tapped_creatures = base.tapped_creatures + (1 if tapped else 0)
         return dataclasses.replace(
-            self,
-            battle_creatures=self.battle_creatures + 1,
+            base,
+            battle_creatures=base.battle_creatures + 1,
             tapped_creatures=tapped_creatures,
-            total_power=self.total_power + power,
-            max_power=max(self.max_power, power),
+            total_power=base.total_power + power,
+            max_power=max(base.max_power, power),
+            available_mana=max(0.0, base.available_mana - float(card.cost or 0)),
         )
 
     def with_creature_destroyed(self, power: float, *, was_tapped: bool = True) -> "PlayerSummary":
@@ -122,6 +189,13 @@ def summarize_player(player: Player) -> PlayerSummary:
         civilization for card in player.mana_zone for civilization in card.civilizations
     }
 
+    hand_cards = len(player.hand)
+    hand_costs = [float(card.cost or 0) for card in player.hand]
+    hand_creatures = sum(1 for card in player.hand if card.is_creature())
+    hand_spells = sum(1 for card in player.hand if card.is_spell())
+    hand_cost_total = float(sum(hand_costs))
+    hand_cost_max = max(hand_costs, default=0.0)
+
     return PlayerSummary(
         battle_creatures=battle_creatures,
         tapped_creatures=tapped_creatures,
@@ -132,6 +206,16 @@ def summarize_player(player: Player) -> PlayerSummary:
         mana_civilizations=frozenset(civilizations),
         shields=len(player.shields),
         graveyard=len(player.graveyard),
+        hand_cards=hand_cards,
+        hand_creatures=hand_creatures,
+        hand_spells=hand_spells,
+        hand_cost_total=hand_cost_total,
+        hand_cost_max=hand_cost_max,
+        deck_cards=len(player.deck),
+        available_mana=float(player.available_mana),
+        max_available_mana=float(player.max_available_mana),
+        max_mana=float(player.max_mana),
+        hand_costs=tuple(hand_costs),
     )
 
 
@@ -158,6 +242,7 @@ class LogisticEvaluator:
         self,
         *,
         turn_number: int,
+        phase: str,
         our_summary: PlayerSummary,
         opponent_summary: PlayerSummary,
         effect_depth: int,
@@ -166,9 +251,13 @@ class LogisticEvaluator:
         our_array = our_summary.to_array()
         opponent_array = opponent_summary.to_array()
         diff = our_array - opponent_array
+        phase_vector = np.zeros(len(PHASE_NAMES), dtype=np.float32)
+        phase_index = PHASE_TO_INDEX.get(phase, PHASE_TO_INDEX["turn_end"])
+        phase_vector[phase_index] = 1.0
         features = np.concatenate(
             [
                 np.array([float(max(1, turn_number))], dtype=np.float32),
+                phase_vector,
                 our_array,
                 opponent_array,
                 diff,
@@ -222,11 +311,14 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
         game: Game,
         our_summary: PlayerSummary,
         opponent_summary: PlayerSummary,
+        *,
+        phase: str,
     ) -> float:
         effect_depth = len(game.get_effect_stack())
         shield_depth = len(game.get_shield_trigger_stack())
         return self.evaluator.score(
             turn_number=game.turn_number,
+            phase=phase,
             our_summary=our_summary,
             opponent_summary=opponent_summary,
             effect_depth=effect_depth,
@@ -246,13 +338,23 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
             return super().choose_mana_charge(game, player, options)
 
         our_summary, opponent_summary = self._current_summaries(game, player)
-        base_score = self._score_from_summaries(game, our_summary, opponent_summary)
+        base_score = self._score_from_summaries(
+            game,
+            our_summary,
+            opponent_summary,
+            phase="pre_mana",
+        )
         best_card: Optional[Card] = None
         best_score = base_score
 
         for card in options:
             candidate_summary = our_summary.with_mana_card(card)
-            score = self._score_from_summaries(game, candidate_summary, opponent_summary)
+            score = self._score_from_summaries(
+                game,
+                candidate_summary,
+                opponent_summary,
+                phase="post_mana",
+            )
             if score > best_score + self.min_delta:
                 best_score = score
                 best_card = card
@@ -272,7 +374,12 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
             return super().choose_card_to_play(game, player, playable_cards)
 
         our_summary, opponent_summary = self._current_summaries(game, player)
-        base_score = self._score_from_summaries(game, our_summary, opponent_summary)
+        base_score = self._score_from_summaries(
+            game,
+            our_summary,
+            opponent_summary,
+            phase="pre_main",
+        )
         best_choice: Optional[Tuple[Card, Optional[Sequence[Card]]]] = None
         best_score = base_score
 
@@ -282,7 +389,12 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
                 continue
             if card.is_creature():
                 candidate_summary = our_summary.with_creature_added(card, tapped=False)
-                score = self._score_from_summaries(game, candidate_summary, opponent_summary)
+                score = self._score_from_summaries(
+                    game,
+                    candidate_summary,
+                    opponent_summary,
+                    phase="pre_main",
+                )
                 if score > best_score + self.min_delta:
                     best_score = score
                     best_choice = (card, targets)
@@ -312,7 +424,12 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
             return None
 
         our_summary, opponent_summary = self._current_summaries(game, attacker_owner)
-        base_score = self._score_from_summaries(game, our_summary, opponent_summary)
+        base_score = self._score_from_summaries(
+            game,
+            our_summary,
+            opponent_summary,
+            phase="pre_attack",
+        )
         best_score = base_score
         best_action: Optional[Tuple[Card, Tuple[str, Optional[Card]]]] = None
 
@@ -371,10 +488,17 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
         else:
             return float("-inf")
 
-        return self._score_from_summaries(game, post_our, post_opponent)
+        return self._score_from_summaries(
+            game,
+            post_our,
+            post_opponent,
+            phase="post_attack",
+        )
 
 
 __all__ = [
+    "PHASE_NAMES",
+    "PHASE_TO_INDEX",
     "LogisticEvaluator",
     "ModelGuidedCpuAgent",
     "PlayerSummary",

@@ -660,6 +660,7 @@ class Game:
         self.pending_creature_entry_triggers: List[Tuple[Player, Card]] = []
         self.effect_stack: List[Dict[str, Any]] = []
         self.turn_end_snapshots: Dict[int, Dict[str, Any]] = {}
+        self.turn_phase_snapshots: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------
     # Game setup
@@ -1057,9 +1058,10 @@ class Game:
             data["evolution_sources"] = []
         return data
 
-    def _record_turn_end_state(self) -> None:
+    def _snapshot_public_zone_state(self) -> Dict[str, Dict[str, Any]]:
         snapshot: Dict[str, Dict[str, Any]] = {}
         for player in self.players:
+            hand_cards = [self._snapshot_card(card) for card in player.hand]
             snapshot[player.name] = {
                 "battle_zone": [
                     self._snapshot_battle_card(player, card)
@@ -1068,9 +1070,57 @@ class Game:
                 "mana_zone": [self._snapshot_card(card) for card in player.mana_zone],
                 "shields": [self._snapshot_card(card) for card in player.shields],
                 "graveyard": [self._snapshot_card(card) for card in player.graveyard],
+                "hand": hand_cards,
+                "hand_size": len(hand_cards),
+                "deck_size": len(player.deck),
+                "available_mana": player.available_mana,
+                "max_available_mana": player.max_available_mana,
+                "max_mana": player.max_mana,
             }
 
-        self.turn_end_snapshots[self.turn_number] = snapshot
+        return snapshot
+
+    def _record_phase_snapshot(
+        self,
+        phase: str,
+        snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
+        *,
+        effect_depth: Optional[int] = None,
+        shield_depth: Optional[int] = None,
+    ) -> None:
+        if self.turn_number <= 0:
+            return
+
+        if snapshot is None:
+            snapshot = self._snapshot_public_zone_state()
+        if effect_depth is None:
+            effect_depth = len(self.effect_stack)
+        if shield_depth is None:
+            shield_depth = len(self.get_shield_trigger_stack())
+
+        phases = self.turn_phase_snapshots.setdefault(self.turn_number, {})
+        phases[phase] = {
+            "zones": snapshot,
+            "effect_depth": effect_depth,
+            "shield_depth": shield_depth,
+        }
+
+    def _record_turn_end_state(self) -> None:
+        zones = self._snapshot_public_zone_state()
+        effect_depth = len(self.effect_stack)
+        shield_depth = len(self.get_shield_trigger_stack())
+        entry = {
+            "zones": zones,
+            "effect_depth": effect_depth,
+            "shield_depth": shield_depth,
+        }
+        self.turn_end_snapshots[self.turn_number] = entry
+        self._record_phase_snapshot(
+            "turn_end",
+            zones,
+            effect_depth=effect_depth,
+            shield_depth=shield_depth,
+        )
 
     def get_turn_end_zone_state(
         self, turn_number: int
@@ -1078,7 +1128,23 @@ class Game:
         snapshot = self.turn_end_snapshots.get(turn_number)
         if snapshot is None:
             return None
-        return copy.deepcopy(snapshot)
+        zones = snapshot.get("zones") if isinstance(snapshot, dict) else snapshot
+        return copy.deepcopy(zones)
+
+    def get_turn_phase_snapshot(
+        self, turn_number: int, phase: str
+    ) -> Optional[Dict[str, Any]]:
+        phase_snapshots = self.turn_phase_snapshots.get(turn_number)
+        if not phase_snapshots:
+            return None
+        entry = phase_snapshots.get(phase)
+        if entry is None:
+            return None
+        return {
+            "zones": copy.deepcopy(entry.get("zones", {})),
+            "effect_depth": entry.get("effect_depth", 0),
+            "shield_depth": entry.get("shield_depth", 0),
+        }
 
     def _handle_creature_entry(
         self, player: Player, card: Card, *, defer_triggers: bool = False
@@ -1184,56 +1250,60 @@ class Game:
 
     def _mana_charge_step(self, player: Player) -> None:
         self._set_step(TurnStep.MANA_CHARGE)
-        agent = self._cpu_agent_for(player)
-        if agent is not None:
-            options = self.available_mana_charge_cards(player)
-            if not options:
-                self.output(f"{player.name}はマナチャージを行いません。")
+        self._record_phase_snapshot("pre_mana")
+        try:
+            agent = self._cpu_agent_for(player)
+            if agent is not None:
+                options = self.available_mana_charge_cards(player)
+                if not options:
+                    self.output(f"{player.name}はマナチャージを行いません。")
+                    return
+
+                selection = agent.choose_mana_charge(self, player, options)
+                if selection is None:
+                    self.output(f"{player.name}はマナチャージを行いません。")
+                    return
+
+                if selection not in options:
+                    raise GameError("CPUが不正なマナチャージ対象を選択しました。")
+
+                self.output(f"{player.name}は《{selection.name}》をマナチャージしました。")
+                self.charge_mana(player, selection)
                 return
 
-            selection = agent.choose_mana_charge(self, player, options)
-            if selection is None:
-                self.output(f"{player.name}はマナチャージを行いません。")
-                return
-
-            if selection not in options:
-                raise GameError("CPUが不正なマナチャージ対象を選択しました。")
-
-            self.output(f"{player.name}は《{selection.name}》をマナチャージしました。")
-            self.charge_mana(player, selection)
-            return
-
-        if not self._player_can_charge_mana(player):
-            if not player.hand:
-                self.output("手札が空のためマナチャージステップを終了します。")
-            elif self.mana_charged_this_turn:
-                self.output("このターンは既にマナチャージ済みです。")
-            else:
-                self.output("マナチャージ可能なカードがありません。")
-            return
-
-        self._display_hand(player)
-        choice = self.input(
-            "マナチャージするカードの番号（0-9）を入力してください。その他の入力でスキップします："
-        ).strip()
-
-        if choice in SINGLE_DIGIT_CHOICES:
-            index = int(choice)
-            if index < len(player.hand):
-                card = player.hand[index]
-                try:
-                    self.charge_mana(player, card)
-                except GameError as exc:
-                    self.output(f"マナチャージできません：{exc}")
+            if not self._player_can_charge_mana(player):
+                if not player.hand:
+                    self.output("手札が空のためマナチャージステップを終了します。")
+                elif self.mana_charged_this_turn:
+                    self.output("このターンは既にマナチャージ済みです。")
                 else:
-                    self.output(f"《{card.name}》をマナゾーンに置きました。")
-                    self.output(
-                        f"使用可能マナ：{player.available_mana}/{player.max_available_mana}"
-                    )
+                    self.output("マナチャージ可能なカードがありません。")
+                return
+
+            self._display_hand(player)
+            choice = self.input(
+                "マナチャージするカードの番号（0-9）を入力してください。その他の入力でスキップします："
+            ).strip()
+
+            if choice in SINGLE_DIGIT_CHOICES:
+                index = int(choice)
+                if index < len(player.hand):
+                    card = player.hand[index]
+                    try:
+                        self.charge_mana(player, card)
+                    except GameError as exc:
+                        self.output(f"マナチャージできません：{exc}")
+                    else:
+                        self.output(f"《{card.name}》をマナゾーンに置きました。")
+                        self.output(
+                            f"使用可能マナ：{player.available_mana}/{player.max_available_mana}"
+                        )
+                else:
+                    self.output("無効な番号です。マナチャージをスキップします。")
             else:
-                self.output("無効な番号です。マナチャージをスキップします。")
-        else:
-            self.output("マナチャージを行いませんでした。")
+                self.output("マナチャージを行いませんでした。")
+        finally:
+            self._record_phase_snapshot("post_mana")
 
     def charge_mana(self, player: Player, card: Card) -> None:
         if player is not self.turn_player:
@@ -1254,72 +1324,76 @@ class Game:
 
     def _main_step(self, player: Player) -> None:
         self._set_step(TurnStep.MAIN)
+        self._record_phase_snapshot("pre_main")
         agent = self._cpu_agent_for(player)
-        if agent is not None:
+        try:
+            if agent is not None:
+                while True:
+                    playable_cards = self.playable_cards(player)
+                    if not playable_cards:
+                        self.output(f"{player.name}はメインステップを行動せずに終了します。")
+                        break
+
+                    decision = agent.choose_card_to_play(self, player, playable_cards)
+                    if decision is None:
+                        self.output(f"{player.name}はメインステップを行動せずに終了します。")
+                        break
+
+                    card, targets = decision
+                    if card not in playable_cards:
+                        raise GameError("CPUが不正なカードを選択しました。")
+
+                    try:
+                        self.play_card_from_hand(player, card, targets)
+                    except GameError as exc:
+                        self.output(f"{player.name}は《{card.name}》をプレイできませんでした：{exc}")
+                        break
+                    else:
+                        self.output(f"{player.name}は《{card.name}》をプレイしました。")
+
+                    if self.game_over:
+                        break
+
+                return
+
             while True:
-                playable_cards = self.playable_cards(player)
-                if not playable_cards:
-                    self.output(f"{player.name}はメインステップを行動せずに終了します。")
+                if not player.hand:
+                    self.output("手札がないためメインステップを終了します。")
                     break
 
-                decision = agent.choose_card_to_play(self, player, playable_cards)
-                if decision is None:
-                    self.output(f"{player.name}はメインステップを行動せずに終了します。")
+                if not self._player_has_playable_card(player):
+                    self.output("プレイ可能なカードがないため自動的にメインステップを終了します。")
                     break
 
-                card, targets = decision
-                if card not in playable_cards:
-                    raise GameError("CPUが不正なカードを選択しました。")
+                self._display_hand(player)
+                choice = self.input(
+                    "プレイするカードの番号（0-9）を入力してください。その他の入力でメインステップを終了します："
+                ).strip()
 
+                if choice not in SINGLE_DIGIT_CHOICES:
+                    self.output("メインステップを終了します。")
+                    break
+
+                index = int(choice)
+                if index >= len(player.hand):
+                    self.output("無効な番号です。手札にあるカードの番号を入力してください。")
+                    continue
+
+                card = player.hand[index]
+                targets = self._gather_spell_targets(card, player)
+                if targets is None:
+                    continue
                 try:
                     self.play_card_from_hand(player, card, targets)
                 except GameError as exc:
-                    self.output(f"{player.name}は《{card.name}》をプレイできませんでした：{exc}")
-                    break
+                    self.output(f"カードをプレイできません：{exc}")
                 else:
-                    self.output(f"{player.name}は《{card.name}》をプレイしました。")
+                    self.output(f"《{card.name}》をプレイしました。")
 
                 if self.game_over:
                     break
-
-            return
-
-        while True:
-            if not player.hand:
-                self.output("手札がないためメインステップを終了します。")
-                break
-
-            if not self._player_has_playable_card(player):
-                self.output("プレイ可能なカードがないため自動的にメインステップを終了します。")
-                break
-
-            self._display_hand(player)
-            choice = self.input(
-                "プレイするカードの番号（0-9）を入力してください。その他の入力でメインステップを終了します："
-            ).strip()
-
-            if choice not in SINGLE_DIGIT_CHOICES:
-                self.output("メインステップを終了します。")
-                break
-
-            index = int(choice)
-            if index >= len(player.hand):
-                self.output("無効な番号です。手札にあるカードの番号を入力してください。")
-                continue
-
-            card = player.hand[index]
-            targets = self._gather_spell_targets(card, player)
-            if targets is None:
-                continue
-            try:
-                self.play_card_from_hand(player, card, targets)
-            except GameError as exc:
-                self.output(f"カードをプレイできません：{exc}")
-            else:
-                self.output(f"《{card.name}》をプレイしました。")
-
-            if self.game_over:
-                break
+        finally:
+            self._record_phase_snapshot("post_main")
 
     def play_card_from_hand(
         self, player: Player, card: Card, targets: Optional[Sequence[Card]] = None
@@ -1361,64 +1435,68 @@ class Game:
 
     def _attack_step(self, player: Player, opponent: Player) -> None:
         self._set_step(TurnStep.ATTACK)
+        self._record_phase_snapshot("pre_attack")
         agent = self._cpu_agent_for(player)
-        if agent is not None:
+        try:
+            if agent is not None:
+                while True:
+                    attackers = self.available_attackers(player)
+                    if not attackers:
+                        self.output(f"{player.name}は攻撃ステップをスキップします。")
+                        break
+
+                    decision = agent.choose_attack(self, player, opponent, attackers)
+                    if decision is None:
+                        self.output(f"{player.name}は攻撃ステップを終了します。")
+                        break
+
+                    attacker, target_info = decision
+                    if attacker not in attackers:
+                        raise GameError("CPUが不正な攻撃クリーチャーを選択しました。")
+
+                    valid_targets = self.available_attack_targets(player, opponent, attacker)
+                    if target_info not in valid_targets:
+                        raise GameError("CPUが不正な攻撃対象を選択しました。")
+
+                    self._execute_attack(player, opponent, attacker, target_info)
+
+                    if self.game_over:
+                        break
+
+                return
+
             while True:
                 attackers = self.available_attackers(player)
                 if not attackers:
-                    self.output(f"{player.name}は攻撃ステップをスキップします。")
+                    self.output("攻撃可能なクリーチャーがいないため攻撃ステップを終了します。")
                     break
 
-                decision = agent.choose_attack(self, player, opponent, attackers)
-                if decision is None:
-                    self.output(f"{player.name}は攻撃ステップを終了します。")
+                self._display_attackers(player, attackers)
+                choice = self.input(
+                    "攻撃するクリーチャーの番号（0-9）を入力してください。その他の入力で攻撃ステップを終了します："
+                ).strip()
+
+                if choice not in SINGLE_DIGIT_CHOICES:
+                    self.output("攻撃ステップを終了します。")
                     break
 
-                attacker, target_info = decision
-                if attacker not in attackers:
-                    raise GameError("CPUが不正な攻撃クリーチャーを選択しました。")
+                index = int(choice)
+                if index >= len(attackers):
+                    self.output("無効な番号です。攻撃可能なクリーチャーの番号を入力してください。")
+                    continue
 
-                valid_targets = self.available_attack_targets(player, opponent, attacker)
-                if target_info not in valid_targets:
-                    raise GameError("CPUが不正な攻撃対象を選択しました。")
+                attacker = attackers[index]
+                target_info = self._choose_attack_target(player, opponent, attacker)
+                if target_info is None:
+                    self.output("攻撃を取りやめました。")
+                    continue
 
                 self._execute_attack(player, opponent, attacker, target_info)
 
                 if self.game_over:
                     break
-
-            return
-
-        while True:
-            attackers = self.available_attackers(player)
-            if not attackers:
-                self.output("攻撃可能なクリーチャーがいないため攻撃ステップを終了します。")
-                break
-
-            self._display_attackers(player, attackers)
-            choice = self.input(
-                "攻撃するクリーチャーの番号（0-9）を入力してください。その他の入力で攻撃ステップを終了します："
-            ).strip()
-
-            if choice not in SINGLE_DIGIT_CHOICES:
-                self.output("攻撃ステップを終了します。")
-                break
-
-            index = int(choice)
-            if index >= len(attackers):
-                self.output("無効な番号です。攻撃可能なクリーチャーの番号を入力してください。")
-                continue
-
-            attacker = attackers[index]
-            target_info = self._choose_attack_target(player, opponent, attacker)
-            if target_info is None:
-                self.output("攻撃を取りやめました。")
-                continue
-
-            self._execute_attack(player, opponent, attacker, target_info)
-
-            if self.game_over:
-                break
+        finally:
+            self._record_phase_snapshot("post_attack")
 
     def available_attackers(self, player: Player) -> List[Card]:
         attackers: List[Card] = []
