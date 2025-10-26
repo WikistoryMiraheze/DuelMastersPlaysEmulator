@@ -334,7 +334,13 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
         player: Player,
         options: Sequence[Card],
     ) -> Optional[Card]:
-        if not self._is_controlled(player) or not options:
+        if not options:
+            return super().choose_mana_charge(game, player, options)
+
+        if not self._is_controlled(player):
+            return super().choose_mana_charge(game, player, options)
+
+        if player.max_mana < 3:
             return super().choose_mana_charge(game, player, options)
 
         our_summary, opponent_summary = self._current_summaries(game, player)
