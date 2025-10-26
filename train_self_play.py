@@ -12,6 +12,8 @@ simple learning loop:
 2. Track stack usage through :meth:`~emulator.Game.get_effect_stack` and
    :meth:`~emulator.Game.get_shield_trigger_stack` to include meta-features.
 3. Train a lightweight logistic-regression baseline on the collected samples.
+4. (Optional) Sample decks from user-provided pools so the model experiences
+   a wider variety of opponents.
 
 The produced model is not meant to be competitive – it merely acts as a
 starting point for experimentation (data collection, feature engineering or
@@ -27,13 +29,13 @@ import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from card_effects import SPELL_TARGET_PROMPTS
 from cpu_ai import SimpleCpuAgent
-from emulator import Game, Player, build_enemy_deck, build_my_deck
+from emulator import Card, Game, Player, build_enemy_deck, build_my_deck, create_card_by_name
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,77 @@ class TrainingConfig:
     save_dataset: Optional[Path] = None
     metrics_output: Optional[Path] = None
     agent: str = "safe-simple"
+    deck_a_specs: Tuple[Tuple[str, ...], ...] = ()
+    deck_b_specs: Tuple[Tuple[str, ...], ...] = ()
+
+
+def _coerce_card_names(raw: Any, source: Path) -> List[str]:
+    if isinstance(raw, dict):
+        for key in ("cards", "deck", "list"):
+            if key in raw:
+                raw = raw[key]
+                break
+        else:
+            raise ValueError(f"{source}: 辞書形式のデッキには 'cards' キーが必要です")
+
+    if isinstance(raw, (str, bytes)):
+        raise ValueError(
+            f"{source}: JSON で単一の文字列は解釈できません。リストで指定してください"
+        )
+
+    if not isinstance(raw, Iterable):
+        raise ValueError(f"{source}: デッキ形式を解釈できませんでした ({type(raw)!r})")
+
+    names: List[str] = []
+    for item in raw:
+        name = str(item).strip()
+        if not name:
+            continue
+        names.append(name)
+
+    if not names:
+        raise ValueError(f"{source}: カード名が 1 枚も見つかりませんでした")
+    return names
+
+
+def load_deck_specs(paths: Sequence[Path]) -> Tuple[Tuple[str, ...], ...]:
+    specs: List[Tuple[str, ...]] = []
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"{path}: ファイルを読み込めませんでした: {exc}") from exc
+        if path.suffix.lower() in {".json", ".jsn"}:
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: JSON の読み込みに失敗しました: {exc}") from exc
+            names = _coerce_card_names(payload, path)
+        else:
+            names = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                names.append(stripped)
+            if not names:
+                raise ValueError(f"{path}: 有効なカード名が見つかりませんでした")
+        specs.append(tuple(names))
+    return tuple(specs)
+
+
+def make_deck_factory(
+    specs: Tuple[Tuple[str, ...], ...],
+    fallback: Callable[[], List[Card]],
+) -> DeckFactory:
+    if not specs:
+        return fallback
+
+    def factory() -> List[Card]:
+        template = random.choice(specs)
+        return [create_card_by_name(name) for name in template]
+
+    return factory
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +323,19 @@ def _dummy_output(_message: str) -> None:
     """Discard emulator output during automated training."""
 
 
+DeckFactory = Callable[[], List[Card]]
+
+
 def collect_game_samples(
     game_index: int,
     agent: SimpleCpuAgent,
+    deck_factory_a: DeckFactory,
+    deck_factory_b: DeckFactory,
 ) -> Tuple[List[np.ndarray], Optional[int], Dict[str, Any]]:
     """Play a single game and return per-turn feature vectors."""
 
-    player1 = Player(name=f"学習プレイヤーA#{game_index}", deck=build_my_deck())
-    player2 = Player(name=f"学習プレイヤーB#{game_index}", deck=build_enemy_deck())
+    player1 = Player(name=f"学習プレイヤーA#{game_index}", deck=deck_factory_a())
+    player2 = Player(name=f"学習プレイヤーB#{game_index}", deck=deck_factory_b())
 
     game = Game(
         player1,
@@ -410,6 +488,9 @@ def collect_dataset(config: TrainingConfig) -> Tuple[np.ndarray, np.ndarray, Dic
     rng = random.Random(config.seed)
     agent = build_agent(config.agent)
 
+    deck_factory_a = make_deck_factory(config.deck_a_specs, build_my_deck)
+    deck_factory_b = make_deck_factory(config.deck_b_specs, build_enemy_deck)
+
     all_features: List[np.ndarray] = []
     all_labels: List[int] = []
     per_game_metrics: List[Dict[str, Any]] = []
@@ -419,7 +500,12 @@ def collect_dataset(config: TrainingConfig) -> Tuple[np.ndarray, np.ndarray, Dic
         random_seed = rng.randrange(1 << 30)
         random.seed(random_seed)
 
-        samples, label, metrics = collect_game_samples(game_index, agent)
+        samples, label, metrics = collect_game_samples(
+            game_index,
+            agent,
+            deck_factory_a,
+            deck_factory_b,
+        )
         per_game_metrics.append(metrics)
 
         if label is None:
@@ -595,8 +681,42 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainingConfig:
         default="safe-simple",
         help="CPU agent preset to use (simple, safe-simple)",
     )
+    parser.add_argument(
+        "--deck",
+        dest="deck_shared",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Deck list file applied to both players. Accepts JSON lists or simple "
+            "newline-separated text files. Option can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--deck-a",
+        dest="deck_a",
+        type=Path,
+        action="append",
+        default=[],
+        help="Deck list file for player A (learning side). Option can be repeated.",
+    )
+    parser.add_argument(
+        "--deck-b",
+        dest="deck_b",
+        type=Path,
+        action="append",
+        default=[],
+        help="Deck list file for player B (opponent side). Option can be repeated.",
+    )
 
     args = parser.parse_args(argv)
+    try:
+        shared_specs = load_deck_specs(args.deck_shared)
+        deck_a_specs = shared_specs + load_deck_specs(args.deck_a)
+        deck_b_specs = shared_specs + load_deck_specs(args.deck_b)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     return TrainingConfig(
         games=args.games,
         learning_rate=args.learning_rate,
@@ -609,6 +729,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainingConfig:
         save_dataset=args.save_dataset,
         metrics_output=args.metrics_output,
         agent=args.agent,
+        deck_a_specs=deck_a_specs,
+        deck_b_specs=deck_b_specs,
     )
 
 
