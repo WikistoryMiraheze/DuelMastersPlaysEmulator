@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from typing import Optional, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from emulator import Card, Game, Player
+
+CARD_NAME = "マドウ・スクラム"
+TARGETS_REQUIRED = True
+
+
+def spell_effect(
+    game: "Game", caster: "Player", opponent: "Player", targets: Sequence["Card"]
+) -> None:
+    if not targets:
+        return
+    creature = targets[0]
+    if creature not in opponent.battle_zone or not creature.is_creature():
+        from emulator import GameError
+
+        raise GameError("対象は相手のクリーチャーでなければなりません。")
+    power = game._calculate_card_power(opponent, creature)
+    if power > 5000:
+        from emulator import GameError
+
+        raise GameError("対象のパワーは5000以下でなければなりません。")
+    from emulator import Zone
+
+    game._move_card_with_evolution(opponent, creature, Zone.BATTLE, Zone.MANA)
+    game.log_spell_effect_detail(opponent, f"《{creature.name}》をマナゾーンへ")
+    game._update_board_window()
+
+
+def prompt_targets(game: "Game", caster: "Player") -> Optional[Sequence["Card"]]:
+    return game.prompt_power_limited_target(caster, 5000)
+
+
+def auto_targets(game: "Game", caster: "Player") -> Optional[Sequence["Card"]]:
+    opponent = game.non_turn_player if caster is game.turn_player else game.turn_player
+    for creature in opponent.battle_zone:
+        if creature.is_creature() and game._calculate_card_power(opponent, creature) <= 5000:
+            return (creature,)
+    return ()
