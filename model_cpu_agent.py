@@ -345,7 +345,7 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
             phase="pre_mana",
         )
         best_card: Optional[Card] = None
-        best_score = base_score
+        best_score = float("-inf")
 
         for card in options:
             candidate_summary = our_summary.with_mana_card(card)
@@ -355,9 +355,15 @@ class ModelGuidedCpuAgent(SimpleCpuAgent):
                 opponent_summary,
                 phase="post_mana",
             )
-            if score > best_score + self.min_delta:
+            if score > best_score:
                 best_score = score
                 best_card = card
+
+        if best_card is None:
+            return super().choose_mana_charge(game, player, options)
+
+        if best_score + self.min_delta < base_score:
+            return super().choose_mana_charge(game, player, options)
 
         return best_card
 
