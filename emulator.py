@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import copy
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import random
@@ -657,6 +658,8 @@ class Game:
         self.battle_log_lines: List[str] = []
         self.turn_power_modifiers: Dict[Card, int] = {}
         self.pending_creature_entry_triggers: List[Tuple[Player, Card]] = []
+        self.effect_stack: List[Dict[str, Any]] = []
+        self.turn_end_snapshots: Dict[int, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Game setup
@@ -788,6 +791,64 @@ class Game:
         if self.human_player_index is None:
             return player.name
         return "自分" if self._is_human_player(player) else "相手"
+
+    def _push_effect_stack_entry(
+        self,
+        *,
+        owner: Optional[Player],
+        source: Union[Card, str],
+        effect_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_shield_trigger: bool = False,
+    ) -> Dict[str, Any]:
+        try:
+            owner_index = self._player_index(owner) if owner is not None else None
+        except GameError:
+            owner_index = None
+
+        if isinstance(source, Card):
+            source_name = source.name
+            source_card_id = source.card_id
+        else:
+            source_name = str(source)
+            source_card_id = None
+
+        entry: Dict[str, Any] = {
+            "owner_name": owner.name if owner is not None else None,
+            "owner_index": owner_index,
+            "source_name": source_name,
+            "source_card_id": source_card_id,
+            "effect_type": effect_type,
+            "is_shield_trigger": is_shield_trigger,
+            "metadata": copy.deepcopy(metadata) if metadata else {},
+        }
+        self.effect_stack.append(entry)
+        return entry
+
+    def _pop_effect_stack_entry(self, entry: Dict[str, Any]) -> None:
+        try:
+            self.effect_stack.remove(entry)
+        except ValueError:
+            pass
+
+    def _clone_stack_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        cloned = dict(entry)
+        cloned["metadata"] = copy.deepcopy(entry.get("metadata", {}))
+        return cloned
+
+    def get_effect_stack(self) -> List[Dict[str, Any]]:
+        """Return a copy of the currently resolving effect stack."""
+
+        return [self._clone_stack_entry(entry) for entry in self.effect_stack]
+
+    def get_shield_trigger_stack(self) -> List[Dict[str, Any]]:
+        """Return stack entries that originated from shield triggers."""
+
+        return [
+            entry
+            for entry in self.get_effect_stack()
+            if entry.get("is_shield_trigger")
+        ]
 
     def _log_turn_start(self, player: Player) -> None:
         try:
@@ -971,6 +1032,54 @@ class Game:
         text = self._build_board_window_text()
         self.board_window.update(text)
 
+    def _snapshot_card(self, card: Card) -> Dict[str, Any]:
+        return {
+            "name": card.name,
+            "civilizations": sorted(card.civilizations),
+            "types": sorted(card.types),
+            "races": sorted(card.races),
+            "power": card.power,
+            "cost": card.cost,
+            "mana_number": card.mana_number,
+            "abilities": list(card.abilities),
+            "card_id": card.card_id,
+        }
+
+    def _snapshot_battle_card(self, player: Player, card: Card) -> Dict[str, Any]:
+        data = self._snapshot_card(card)
+        data["tapped"] = player.is_creature_tapped(card) if card.is_creature() else None
+        data["entry_turn"] = player.creature_entry_turn(card)
+        if card.is_evolution():
+            data["evolution_sources"] = [
+                base.name for base in player.get_evolution_sources(card)
+            ]
+        else:
+            data["evolution_sources"] = []
+        return data
+
+    def _record_turn_end_state(self) -> None:
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for player in self.players:
+            snapshot[player.name] = {
+                "battle_zone": [
+                    self._snapshot_battle_card(player, card)
+                    for card in player.battle_zone
+                ],
+                "mana_zone": [self._snapshot_card(card) for card in player.mana_zone],
+                "shields": [self._snapshot_card(card) for card in player.shields],
+                "graveyard": [self._snapshot_card(card) for card in player.graveyard],
+            }
+
+        self.turn_end_snapshots[self.turn_number] = snapshot
+
+    def get_turn_end_zone_state(
+        self, turn_number: int
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        snapshot = self.turn_end_snapshots.get(turn_number)
+        if snapshot is None:
+            return None
+        return copy.deepcopy(snapshot)
+
     def _handle_creature_entry(
         self, player: Player, card: Card, *, defer_triggers: bool = False
     ) -> None:
@@ -995,7 +1104,15 @@ class Game:
     def _execute_creature_entry_trigger(self, player: Player, card: Card) -> None:
         effect = ENTER_BATTLE_ZONE_EFFECTS.get(card.name)
         if effect is not None:
-            effect(self, player, card)
+            entry = self._push_effect_stack_entry(
+                owner=player,
+                source=card,
+                effect_type="enter_battle_zone",
+            )
+            try:
+                effect(self, player, card)
+            finally:
+                self._pop_effect_stack_entry(entry)
 
     def _draw_cards_from_effect(
         self, player: Player, amount: int, source: Union[Card, str]
@@ -1459,7 +1576,16 @@ class Game:
     ) -> None:
         effect = ATTACK_TRIGGER_EFFECTS.get(attacker.name)
         if effect is not None:
-            effect(self, attacker_owner, defender, attacker)
+            entry = self._push_effect_stack_entry(
+                owner=attacker_owner,
+                source=attacker,
+                effect_type="attack_trigger",
+                metadata={"defender": defender.name},
+            )
+            try:
+                effect(self, attacker_owner, defender, attacker)
+            finally:
+                self._pop_effect_stack_entry(entry)
 
     def _choose_blocker(self, defender: Player, attacker: Card) -> Optional[Card]:
         blockers = self.available_blockers(defender, attacker)
@@ -1543,7 +1669,15 @@ class Game:
         for card, owner in ((attacker, attacker_owner), (defender_creature, defender)):
             effect = POST_BATTLE_EFFECTS.get(card.name)
             if effect is not None:
-                effect(self, owner, card)
+                entry = self._push_effect_stack_entry(
+                    owner=owner,
+                    source=card,
+                    effect_type="post_battle",
+                )
+                try:
+                    effect(self, owner, card)
+                finally:
+                    self._pop_effect_stack_entry(entry)
 
     def _handle_shield_break(
         self, attacker_owner: Player, defender: Player, attacker: Card
@@ -1765,26 +1899,40 @@ class Game:
                     targets = ()
             self._log_spell_cast(defender, card)
             self._log_spell_resolution(defender, card)
-            self._resolve_spell(card, defender, tuple(targets))
+            self._resolve_spell(
+                card,
+                defender,
+                tuple(targets),
+                is_shield_trigger=True,
+            )
             defender.graveyard.append(card)
             self._update_board_window()
             return True
 
         if card.is_creature():
-            if card.is_evolution():
-                bases = self._valid_evolution_bases(defender, card)
-                if not bases:
-                    return False
-                base = bases[0]
-                self._apply_evolution(defender, card, base)
-            else:
-                defender._add_card_to_zone(card, Zone.BATTLE)
-            self._handle_creature_entry(defender, card, defer_triggers=True)
-            self._log_summon(defender, card)
-            self._update_board_window()
-            if card not in defender.battle_zone and card not in defender.graveyard:
-                defender.graveyard.append(card)
-            return True
+            entry = self._push_effect_stack_entry(
+                owner=defender,
+                source=card,
+                effect_type="shield_trigger_creature",
+                is_shield_trigger=True,
+            )
+            try:
+                if card.is_evolution():
+                    bases = self._valid_evolution_bases(defender, card)
+                    if not bases:
+                        return False
+                    base = bases[0]
+                    self._apply_evolution(defender, card, base)
+                else:
+                    defender._add_card_to_zone(card, Zone.BATTLE)
+                self._handle_creature_entry(defender, card, defer_triggers=True)
+                self._log_summon(defender, card)
+                self._update_board_window()
+                if card not in defender.battle_zone and card not in defender.graveyard:
+                    defender.graveyard.append(card)
+                return True
+            finally:
+                self._pop_effect_stack_entry(entry)
 
         return False
 
@@ -1794,17 +1942,41 @@ class Game:
         for creature in list(player.battle_zone):
             effect = END_STEP_EFFECTS.get(creature.name)
             if effect is not None:
-                effect(self, player, creature)
+                entry = self._push_effect_stack_entry(
+                    owner=player,
+                    source=creature,
+                    effect_type="end_step",
+                )
+                try:
+                    effect(self, player, creature)
+                finally:
+                    self._pop_effect_stack_entry(entry)
+        self._record_turn_end_state()
 
     def _resolve_spell(
-        self, card: Card, caster: Player, targets: Sequence[Card]
+        self,
+        card: Card,
+        caster: Player,
+        targets: Sequence[Card],
+        *,
+        is_shield_trigger: bool = False,
     ) -> None:
         opponent = self.non_turn_player if caster is self.turn_player else self.turn_player
         effect = SPELL_EFFECTS.get(card.name)
         if effect is None:
             return
 
-        effect(self, caster, opponent, targets)
+        entry = self._push_effect_stack_entry(
+            owner=caster,
+            source=card,
+            effect_type="spell",
+            metadata={"targets": [target.name for target in targets]},
+            is_shield_trigger=is_shield_trigger,
+        )
+        try:
+            effect(self, caster, opponent, targets)
+        finally:
+            self._pop_effect_stack_entry(entry)
 
     def _move_card_with_evolution(
         self, player: Player, card: Card, from_zone: Zone, to_zone: Zone
