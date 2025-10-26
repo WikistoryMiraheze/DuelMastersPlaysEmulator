@@ -120,5 +120,11 @@ logits = normalised @ weights + bias
 prob = 1.0 / (1.0 + np.exp(-logits))
 ```
 
-これをベースに、エージェントの行動選択ロジックへ組み込むことができます。
+CLI を使って手早く試したい場合は `play_with_model.py` も利用できます。保存したモデルを読み込み、学習時と同じ特徴量正規化を行ったうえで `ModelGuidedCpuAgent` を動かし、シンプル CPU 相手とのヘッドレス対戦や CLI 対戦を実行できます。例:
+
+```bash
+python play_with_model.py artifacts/model.npz --games 20 --verbose
+```
+
+このコマンドはモデルを使ったエージェントを 20 ゲーム分ヘッドレスで評価し、各ゲームの勝敗を表示します。対話的にプレイしたい場合は `--mode interactive` を指定してください。
 
